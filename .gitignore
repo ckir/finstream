@@ -1,0 +1,15 @@
+# Node
+node_modules
+dist
+.eslintcache
+
+# Rust
+target
+Cargo.lock
+
+# Sidecars & OS
+.bin
+.DS_Store
+.env
+*.node
+finstream.txt

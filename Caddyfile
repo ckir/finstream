@@ -1,0 +1,13 @@
+# FinStream Gateway Configuration
+:8080 {
+    # Serve TypeDoc static files
+    handle_path /docs/* {
+        root * docs/api
+        file_server browse
+    }
+
+    # Proxy API and WS traffic to the Node/Bun server
+    handle /api/* {
+        reverse_proxy localhost:3000
+    }
+}
