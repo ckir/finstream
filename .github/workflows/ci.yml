@@ -59,14 +59,14 @@ jobs:
             cargo: cargo
             ext: .exe
 
-          # macOS — native runners per architecture
+          # macOS — both targets cross-compiled on Apple Silicon runner
           - target: x86_64-apple-darwin
-            os: macos-13          # Intel runner
+            os: macos-14          # cross-compile Intel target on Apple Silicon
             cargo: cargo
             ext: ''
 
           - target: aarch64-apple-darwin
-            os: macos-14          # Apple Silicon runner
+            os: macos-14          # native
             cargo: cargo
             ext: ''
 
