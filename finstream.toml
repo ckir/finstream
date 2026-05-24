@@ -1,0 +1,28 @@
+[server]
+port      = 9001
+log_level = "info"   # trace | debug | info | warn | error
+
+[reconnect]
+initial_delay_secs      = 1
+max_delay_secs          = 60
+jitter                  = true
+# max_retries           = 10    # omit for no count limit
+# max_retry_duration_secs = 3600  # omit for no time limit; overridden by --retry-timeout
+
+[providers.alpaca]
+enabled = true
+feed    = "iex"     # iex | sip
+
+[providers.finnhub]
+enabled = true
+
+[providers.massive]
+enabled = false
+
+[providers.yahoo]
+enabled            = true
+silence_secs       = 60
+ping_interval_secs = 30
+
+[symbols]
+default = ["AAPL", "MSFT", "GOOGL"]

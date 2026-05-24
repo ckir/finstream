@@ -1,15 +1,4 @@
-# Node
-node_modules
-dist
-.eslintcache
-
-# Rust
-target
-Cargo.lock
-
-# Sidecars & OS
-.bin
-.DS_Store
+/target
 .env
-*.node
-finstream.txt
+*.redb
+Cargo.lock

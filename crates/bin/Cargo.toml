@@ -1,0 +1,24 @@
+[package]
+name        = "finstream"
+description = "Unified financial data WebSocket gateway"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "finstream"
+path = "src/main.rs"
+
+[dependencies]
+finstream-core = { path = "../core", features = ["alpaca", "finnhub", "massive", "yahoo"] }
+tokio.workspace             = true
+axum.workspace              = true
+clap.workspace              = true
+serde_json.workspace        = true
+serde.workspace             = true
+tracing.workspace           = true
+tracing-subscriber.workspace = true
+config            = { version = "0.14", features = ["toml"] }
+dotenvy.workspace           = true
+anyhow                      = "1"
