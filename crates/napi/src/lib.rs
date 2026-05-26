@@ -40,7 +40,11 @@ impl FinStream {
     ) -> Result<Self> {
         let (_client, mut rx) = FinStreamBuilder::new()
             .default_policy(ReconnectPolicy::default())
-            .provider(YahooDriver { silence_secs: 60, ping_interval_secs: 30 })
+            .provider(YahooDriver { 
+                name: "yahoo_napi".into(),
+                silence_secs: 60, 
+                ping_interval_secs: 30 
+            })
             .symbols(symbols)
             .connect()
             .map_err(|e| Error::from_reason(e.to_string()))?;

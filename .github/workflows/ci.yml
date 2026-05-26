@@ -91,17 +91,22 @@ jobs:
       - name: Build
         run: ${{ matrix.cargo }} build -p finstream --release --target ${{ matrix.target }}
 
-      - name: Stage artifact
+      - name: Stage artifacts
         shell: bash
         run: |
-          cp target/${{ matrix.target }}/release/finstream${{ matrix.ext }} \
-             finstream-${{ matrix.target }}${{ matrix.ext }}
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/finstream${{ matrix.ext }} staging/
+          cp target/${{ matrix.target }}/release/finstream-live-test${{ matrix.ext }} staging/
+          
+          # Rename for final artifact upload
+          mv staging/finstream${{ matrix.ext }} finstream-${{ matrix.target }}${{ matrix.ext }}
+          mv staging/finstream-live-test${{ matrix.ext }} finstream-live-test-${{ matrix.target }}${{ matrix.ext }}
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: finstream-${{ matrix.target }}
-          path: finstream-${{ matrix.target }}${{ matrix.ext }}
+          name: artifacts-${{ matrix.target }}
+          path: finstream*-${{ matrix.target }}${{ matrix.ext }}
           if-no-files-found: error
           retention-days: 1
 

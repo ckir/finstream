@@ -15,13 +15,14 @@ use crate::{
 /// Valid Alpaca data feeds.
 #[derive(Debug, Clone)]
 pub enum AlpacaFeed {
-    /// IEX feed (free tier, ~8-10% market volume)
+    /// IEX feed (free tier, ~8-10% market volume).
     Iex,
-    /// SIP consolidated feed (requires Unlimited subscription)
+    /// SIP consolidated feed (requires Unlimited subscription).
     Sip,
 }
 
 impl AlpacaFeed {
+    /// Returns the WebSocket URL for the selected feed.
     pub fn ws_url(&self) -> &'static str {
         match self {
             Self::Iex => "wss://stream.data.alpaca.markets/v2/iex",
@@ -29,6 +30,7 @@ impl AlpacaFeed {
         }
     }
 
+    /// Parses a string into an `AlpacaFeed` variant (defaults to IEX).
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "sip" => Self::Sip,
@@ -37,15 +39,25 @@ impl AlpacaFeed {
     }
 }
 
+/// Driver for the Alpaca Markets real-time data WebSocket.
 pub struct AlpacaDriver {
+    /// Unique name for this driver instance.
+    pub name:       String,
+    /// Alpaca API Key ID.
     pub api_key:    String,
+    /// Alpaca API Secret Key.
     pub api_secret: String,
+    /// The data feed to subscribe to (IEX or SIP).
     pub feed:       AlpacaFeed,
 }
 
 impl ProviderDriver for AlpacaDriver {
     fn kind(&self) -> ProviderKind {
         ProviderKind::Alpaca
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn validate(&self) -> Result<(), crate::error::FinStreamError> {
@@ -80,6 +92,7 @@ enum SessionResult {
     Fatal(String),
 }
 
+// Internal run loop that handles automatic reconnection for Alpaca.
 async fn run_loop(
     driver: AlpacaDriver,
     symbols: Vec<String>,
@@ -90,49 +103,71 @@ async fn run_loop(
     let mut first_failure: Option<Instant> = None;
 
     loop {
+        // Start a new WebSocket session
         match ws_session(&driver, &symbols, &tx).await {
-            SessionResult::Stopped => break,
+            SessionResult::Stopped => {
+                // Clean shutdown requested
+                break;
+            }
 
             SessionResult::Fatal(reason) => {
-                error!(provider = "alpaca", %reason, "fatal error — not retrying");
+                // Non-retryable error (e.g. invalid credentials)
+                error!(provider = "alpaca", name = %driver.name, %reason, "fatal error — not retrying");
                 let _ = tx
-                    .send(MarketEvent::Status(ProviderStatus::Error {
-                        provider: ProviderKind::Alpaca,
-                        message:  reason,
-                    }))
+                    .send(MarketEvent::Status {
+                        source: driver.name.clone(),
+                        status: ProviderStatus::Error {
+                            provider: ProviderKind::Alpaca,
+                            message:  reason,
+                        }
+                    })
                     .await;
                 return;
             }
 
             SessionResult::Failed(reason) => {
+                // Retryable error (e.g. network timeout)
                 let elapsed = first_failure.get_or_insert_with(Instant::now).elapsed();
 
+                // Check if we should stop retrying based on policy
                 if policy.is_exceeded(attempt, elapsed) {
                     let _ = tx
-                        .send(MarketEvent::Status(ProviderStatus::Error {
-                            provider: ProviderKind::Alpaca,
-                            message:  format!("retry limit reached: {reason}"),
-                        }))
+                        .send(MarketEvent::Status {
+                            source: driver.name.clone(),
+                            status: ProviderStatus::Error {
+                                provider: ProviderKind::Alpaca,
+                                message:  format!("retry limit reached: {reason}"),
+                            }
+                        })
                         .await;
                     return;
                 }
 
+                // Calculate backoff delay
                 let delay = policy.next_delay(attempt);
                 attempt += 1;
-                warn!(provider = "alpaca", attempt, ?delay, %reason, "reconnecting");
+                warn!(provider = "alpaca", name = %driver.name, attempt, ?delay, %reason, "reconnecting");
+                
+                // Notify listeners about the reconnection attempt
                 let _ = tx
-                    .send(MarketEvent::Status(ProviderStatus::Reconnecting {
-                        provider: ProviderKind::Alpaca,
-                        attempt,
-                        delay_ms: delay.as_millis() as u64,
-                    }))
+                    .send(MarketEvent::Status {
+                        source: driver.name.clone(),
+                        status: ProviderStatus::Reconnecting {
+                            provider: ProviderKind::Alpaca,
+                            attempt,
+                            delay_ms: delay.as_millis() as u64,
+                        }
+                    })
                     .await;
+                
+                // Wait before next attempt
                 tokio::time::sleep(delay).await;
             }
         }
     }
 }
 
+// Internal session handler that performs Alpaca-specific auth and subscription.
 async fn ws_session(
     driver: &AlpacaDriver,
     symbols: &[String],
@@ -144,7 +179,7 @@ async fn ws_session(
     let (ws_stream, _) = match connect_async(url).await {
         Ok(v) => v,
         Err(e) => {
-            error!(provider = "alpaca", %e, "connect failed");
+            error!(provider = "alpaca", name = %driver.name, %e, "connect failed");
             return SessionResult::Failed(e.to_string());
         }
     };
@@ -154,12 +189,14 @@ async fn ws_session(
     // ── Step 2: Expect [{"T":"success","msg":"connected"}] ───────────────────
     match read.next().await {
         Some(Ok(Message::Text(text))) => {
+            // Parse the initial message from Alpaca
             let msgs: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
             let first = &msgs[0];
+            // Validate that we are successfully connected to the streamer
             if first["T"] != "success" || first["msg"] != "connected" {
                 return SessionResult::Fatal(format!("unexpected connected message: {text}"));
             }
-            debug!(provider = "alpaca", "received connected");
+            debug!(provider = "alpaca", name = %driver.name, "received connected");
         }
         other => {
             return SessionResult::Fatal(format!("expected connected message, got: {other:?}"));
@@ -174,7 +211,8 @@ async fn ws_session(
     })
     .to_string();
 
-    debug!(provider = "alpaca", action = "auth", "→ send");
+    debug!(provider = "alpaca", name = %driver.name, action = "auth", "→ send");
+    // Transmit credentials to Alpaca
     if write.send(Message::Text(auth.into())).await.is_err() {
         return SessionResult::Failed("auth send failed".into());
     }
@@ -182,35 +220,44 @@ async fn ws_session(
     // ── Step 4: Expect [{"T":"success","msg":"authenticated"}] ───────────────
     match read.next().await {
         Some(Ok(Message::Text(text))) => {
+            // Parse auth response
             let msgs: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
             let first = &msgs[0];
+            // Check for explicit auth failure
             if first["T"] == "error" {
                 let msg = first["msg"].as_str().unwrap_or("auth error").to_string();
-                error!(provider = "alpaca", %msg, "auth rejected");
+                error!(provider = "alpaca", name = %driver.name, %msg, "auth rejected");
                 return SessionResult::Fatal(msg);
             }
+            // Verify authentication success
             if first["T"] != "success" || first["msg"] != "authenticated" {
                 return SessionResult::Fatal(format!("unexpected auth response: {text}"));
             }
-            info!(provider = "alpaca", feed = ?driver.feed, "authenticated");
+            info!(provider = "alpaca", name = %driver.name, feed = ?driver.feed, "authenticated");
         }
         other => {
             return SessionResult::Fatal(format!("expected authenticated message, got: {other:?}"));
         }
     }
 
+    // Notify listeners that we are connected and authenticated
     let _ = tx
-        .send(MarketEvent::Status(ProviderStatus::Connected { provider: ProviderKind::Alpaca }))
+        .send(MarketEvent::Status {
+            source: driver.name.clone(),
+            status: ProviderStatus::Connected { provider: ProviderKind::Alpaca },
+        })
         .await;
 
     // ── Step 5: Subscribe (quotes only) ──────────────────────────────────────
     if !symbols.is_empty() {
+        // Construct subscription message for the requested tickers
         let sub = serde_json::json!({
             "action": "subscribe",
             "quotes": symbols,
         })
         .to_string();
-        debug!(provider = "alpaca", out = %sub, "→ send");
+        debug!(provider = "alpaca", name = %driver.name, out = %sub, "→ send");
+        // Send subscription request
         if write.send(Message::Text(sub.into())).await.is_err() {
             return SessionResult::Failed("subscribe send failed".into());
         }
@@ -218,6 +265,7 @@ async fn ws_session(
         // ── Step 6: Expect [{"T":"subscription","quotes":[...]}] ─────────────
         match read.next().await {
             Some(Ok(Message::Text(text))) => {
+                // Parse subscription confirmation
                 let msgs: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                 let first = &msgs[0];
                 if first["T"] != "subscription" {
@@ -226,6 +274,7 @@ async fn ws_session(
                     ));
                 }
 
+                // Verify that all requested symbols were successfully subscribed
                 let mut confirmed: Vec<String> = first["quotes"]
                     .as_array()
                     .unwrap_or(&vec![])
@@ -242,7 +291,7 @@ async fn ws_session(
                     ));
                 }
 
-                info!(provider = "alpaca", ?requested, "subscribed");
+                info!(provider = "alpaca", name = %driver.name, ?requested, "subscribed");
             }
             other => {
                 return SessionResult::Fatal(format!(
@@ -254,40 +303,55 @@ async fn ws_session(
 
     // ── Message loop ─────────────────────────────────────────────────────────
     loop {
+        // Main loop to receive and process market data messages
         match read.next().await {
             Some(Ok(Message::Text(text))) => {
-                handle_messages(text.as_str(), tx).await;
+                // Process a batch of messages from Alpaca
+                handle_messages(text.as_str(), tx, &driver.name).await;
             }
             Some(Ok(Message::Ping(d))) => {
+                // Handle WebSocket pings from the server
                 let _ = write.send(Message::Pong(d)).await;
             }
             Some(Ok(Message::Close(frame))) => {
+                // Handle clean connection closure from server
                 let reason = frame.map(|f| f.reason.to_string()).unwrap_or_default();
                 let _ = tx
-                    .send(MarketEvent::Status(ProviderStatus::Disconnected {
-                        provider: ProviderKind::Alpaca,
-                        reason:   reason.clone(),
-                    }))
+                    .send(MarketEvent::Status {
+                        source: driver.name.clone(),
+                        status: ProviderStatus::Disconnected {
+                            provider: ProviderKind::Alpaca,
+                            reason:   reason.clone(),
+                        }
+                    })
                     .await;
                 return SessionResult::Failed(reason);
             }
-            Some(Ok(_)) => {}
+            Some(Ok(_)) => {} // Ignore other binary/pong frames
             Some(Err(e)) => {
-                error!(provider = "alpaca", %e, "ws error");
+                // Handle network/IO errors
+                error!(provider = "alpaca", name = %driver.name, %e, "ws error");
                 let _ = tx
-                    .send(MarketEvent::Status(ProviderStatus::Disconnected {
-                        provider: ProviderKind::Alpaca,
-                        reason:   e.to_string(),
-                    }))
+                    .send(MarketEvent::Status {
+                        source: driver.name.clone(),
+                        status: ProviderStatus::Disconnected {
+                            provider: ProviderKind::Alpaca,
+                            reason:   e.to_string(),
+                        }
+                    })
                     .await;
                 return SessionResult::Failed(e.to_string());
             }
             None => {
+                // Stream ended unexpectedly
                 let _ = tx
-                    .send(MarketEvent::Status(ProviderStatus::Disconnected {
-                        provider: ProviderKind::Alpaca,
-                        reason:   "stream ended".into(),
-                    }))
+                    .send(MarketEvent::Status {
+                        source: driver.name.clone(),
+                        status: ProviderStatus::Disconnected {
+                            provider: ProviderKind::Alpaca,
+                            reason:   "stream ended".into(),
+                        }
+                    })
                     .await;
                 return SessionResult::Failed("stream ended".into());
             }
@@ -295,7 +359,9 @@ async fn ws_session(
     }
 }
 
-async fn handle_messages(text: &str, tx: &mpsc::Sender<MarketEvent>) {
+// Dispatches an Alpaca message batch to appropriate parsers.
+async fn handle_messages(text: &str, tx: &mpsc::Sender<MarketEvent>, source: &str) {
+    // Parse the JSON array of messages
     let msgs: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => return,
@@ -306,31 +372,47 @@ async fn handle_messages(text: &str, tx: &mpsc::Sender<MarketEvent>) {
         None    => return,
     };
 
+    // Process each message in the batch
     for msg in arr {
         match msg["T"].as_str() {
             Some("q") => {
-                if let Some(event) = parse_quote(msg) {
-                    let _ = tx.send(MarketEvent::Quote(event)).await;
+                // Parse normalized quote from the "q" variant
+                if let Some(mut event) = parse_quote(msg) {
+                    // Capture raw payload for debugging if needed
+                    event.raw = Some(msg.to_string());
+                    // Forward to the unified event channel
+                    let _ = tx.send(MarketEvent::Quote {
+                        source: source.to_string(),
+                        data: event,
+                    }).await;
                 }
             }
-            Some(t) => debug!(provider = "alpaca", msg_type = t, "ignored"),
+            Some(t) => {
+                // Ignore other message types (trades "t", system status "s")
+                debug!(provider = "alpaca", name = source, msg_type = t, "ignored");
+            }
             None => {}
         }
     }
 }
 
+// Parses a single Alpaca 'q' (quote) message into a normalized Quote struct.
 fn parse_quote(msg: &serde_json::Value) -> Option<Quote> {
+    // Extract required fields from Alpaca's compact representation
     let ticker    = msg["S"].as_str()?.to_string();
     let bid       = msg["bp"].as_f64().unwrap_or(0.0);
     let ask       = msg["ap"].as_f64().unwrap_or(0.0);
     let bid_size  = msg["bs"].as_f64().unwrap_or(0.0);
     let ask_size  = msg["as"].as_f64().unwrap_or(0.0);
+    
+    // Parse timestamp with RFC3339 format, fallback to now if missing/invalid
     let timestamp = msg["t"]
         .as_str()
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or_else(chrono::Utc::now);
 
+    // Optional metadata fields
     let bid_exchange = msg["bx"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
     let ask_exchange = msg["ax"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
     let conditions   = msg["c"]
@@ -339,8 +421,10 @@ fn parse_quote(msg: &serde_json::Value) -> Option<Quote> {
         .unwrap_or_default();
     let tape = msg["z"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
 
+    // Normalized mid-price
     let price = (bid + ask) / 2.0;
 
+    // Return the normalized Quote
     Some(Quote {
         ticker,
         timestamp,
@@ -348,5 +432,6 @@ fn parse_quote(msg: &serde_json::Value) -> Option<Quote> {
         extras: QuoteExtras::Alpaca(AlpacaQuoteExtras {
             bid, ask, bid_size, ask_size, bid_exchange, ask_exchange, conditions, tape,
         }),
+        raw: None,
     })
 }

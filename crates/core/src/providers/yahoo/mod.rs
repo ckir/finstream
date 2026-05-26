@@ -17,11 +17,12 @@ use crate::{
 };
 use proto_handler::{decode_yahoo_message, YahooPricing};
 
+/// The WebSocket URL for the Yahoo Finance streamer feed.
 const WS_URL: &str = "wss://streamer.finance.yahoo.com/?version=2";
 
 // ── Control messages sent to the running driver task ──────────────────────────
 
-/// Commands that can be sent to a live Yahoo driver task.
+/// Commands that can be sent to a live Yahoo driver task to modify its behavior.
 pub enum YahooControl {
     /// Subscribe to additional symbols on the active connection.
     Subscribe(Vec<String>),
@@ -32,14 +33,23 @@ pub enum YahooControl {
 
 // ── Driver ────────────────────────────────────────────────────────────────────
 
+/// Driver for the Yahoo Finance real-time data WebSocket.
 pub struct YahooDriver {
+    /// Unique name for this driver instance.
+    pub name:               String,
+    /// Reconnect if no data is received for this many seconds.
     pub silence_secs:       u32,
+    /// How often to send a WebSocket ping to keep the connection alive.
     pub ping_interval_secs: u32,
 }
 
 impl ProviderDriver for YahooDriver {
     fn kind(&self) -> ProviderKind {
         ProviderKind::Yahoo
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn spawn(
@@ -55,7 +65,7 @@ impl ProviderDriver for YahooDriver {
 }
 
 impl YahooDriver {
-    /// Spawn the driver and return a control sender for dynamic subscribe/unsubscribe.
+    /// Spawns the driver and returns a control sender for dynamic subscribe/unsubscribe.
     pub fn spawn_with_control(
         self,
         symbols: Vec<String>,
@@ -72,6 +82,7 @@ impl YahooDriver {
 
 // ── Internal run loop ─────────────────────────────────────────────────────────
 
+// Internal run loop that handles automatic reconnection for Yahoo.
 async fn run_loop(
     driver: YahooDriver,
     symbols: Vec<String>,
@@ -81,36 +92,55 @@ async fn run_loop(
 ) {
     let mut attempt = 0u32;
     let mut first_failure: Option<std::time::Instant> = None;
-    // Carry subscriptions across reconnects so they survive a drop.
+    // Carry subscriptions across reconnects so they survive a connection drop.
     let mut active_symbols = symbols;
 
     loop {
+        // Start a new WebSocket session with the current set of active symbols
         match ws_session(&driver, &active_symbols, &tx, ctrl_rx.as_mut()).await {
-            SessionResult::Stopped => break,
+            SessionResult::Stopped => {
+                // Clean shutdown requested
+                break;
+            }
             SessionResult::Failed { reason, symbols_at_close } => {
                 // Preserve whatever symbols were active when the session died.
+                // This ensures we resubscribe to dynamically added symbols after reconnect.
                 active_symbols = symbols_at_close;
 
                 let elapsed = first_failure.get_or_insert_with(std::time::Instant::now).elapsed();
+                
+                // Check retry policy
                 if policy.is_exceeded(attempt, elapsed) {
                     let _ = tx
-                        .send(MarketEvent::Status(ProviderStatus::Error {
-                            provider: ProviderKind::Yahoo,
-                            message:  format!("retry limit reached: {reason}"),
-                        }))
+                        .send(MarketEvent::Status {
+                            source: driver.name.clone(),
+                            status: ProviderStatus::Error {
+                                provider: ProviderKind::Yahoo,
+                                message:  format!("retry limit reached: {reason}"),
+                            }
+                        })
                         .await;
                     return;
                 }
+                
+                // Calculate backoff
                 let delay = policy.next_delay(attempt);
                 attempt += 1;
-                warn!(provider = "yahoo", attempt, ?delay, "reconnecting");
+                warn!(provider = "yahoo", name = %driver.name, attempt, ?delay, "reconnecting");
+                
+                // Notify status
                 let _ = tx
-                    .send(MarketEvent::Status(ProviderStatus::Reconnecting {
-                        provider: ProviderKind::Yahoo,
-                        attempt,
-                        delay_ms: delay.as_millis() as u64,
-                    }))
+                    .send(MarketEvent::Status {
+                        source: driver.name.clone(),
+                        status: ProviderStatus::Reconnecting {
+                            provider: ProviderKind::Yahoo,
+                            attempt,
+                            delay_ms: delay.as_millis() as u64,
+                        }
+                    })
                     .await;
+                
+                // Wait before reconnecting
                 tokio::time::sleep(delay).await;
             }
         }
@@ -129,16 +159,18 @@ enum SessionResult {
     },
 }
 
+// Internal session handler that performs Yahoo-specific Protobuf decoding.
 async fn ws_session(
     driver: &YahooDriver,
     symbols: &[String],
     tx: &mpsc::Sender<MarketEvent>,
     ctrl_rx: Option<&mut mpsc::Receiver<YahooControl>>,
 ) -> SessionResult {
+    // Establish WebSocket connection
     let (ws_stream, _) = match connect_async(WS_URL).await {
         Ok(v) => v,
         Err(e) => {
-            error!(provider = "yahoo", %e, "connect failed");
+            error!(provider = "yahoo", name = %driver.name, %e, "connect failed");
             return SessionResult::Failed {
                 reason:          e.to_string(),
                 symbols_at_close: symbols.to_vec(),
@@ -146,9 +178,13 @@ async fn ws_session(
         }
     };
 
-    info!(provider = "yahoo", "connected");
+    info!(provider = "yahoo", name = %driver.name, "connected");
+    // Notify successful connection
     let _ = tx
-        .send(MarketEvent::Status(ProviderStatus::Connected { provider: ProviderKind::Yahoo }))
+        .send(MarketEvent::Status {
+            source: driver.name.clone(),
+            status: ProviderStatus::Connected { provider: ProviderKind::Yahoo },
+        })
         .await;
 
     let (mut write, mut read) = ws_stream.split();
@@ -156,19 +192,22 @@ async fn ws_session(
     // Track active subscriptions so they can be preserved on reconnect.
     let mut active: Vec<String> = symbols.to_vec();
 
+    // Send initial subscription request if symbols are provided
     if !active.is_empty() {
         let payload = serde_json::json!({ "subscribe": active }).to_string();
-        debug!(provider = "yahoo", out = %payload, "→ send");
+        debug!(provider = "yahoo", name = %driver.name, out = %payload, "→ send");
         if write.send(Message::Text(payload.into())).await.is_err() {
             return failed("subscribe send failed", &active);
         }
     }
 
+    // Configure timers for keep-alive and activity monitoring
     let ping_interval = std::time::Duration::from_secs(driver.ping_interval_secs as u64);
     let silence_limit = std::time::Duration::from_secs(driver.silence_secs as u64);
 
     let mut ping_timer    = tokio::time::interval(ping_interval);
     let mut silence_timer = tokio::time::interval(silence_limit);
+    // Skip initial ticks
     ping_timer.tick().await;
     silence_timer.tick().await;
 
@@ -182,48 +221,65 @@ async fn ws_session(
     };
 
     loop {
+        // Multi-plex between WebSocket data, control messages, and timers
         tokio::select! {
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        // Data received, reset the silence watchdog
                         silence_timer.reset();
-                        handle_text(text.as_str(), tx).await;
+                        // Parse and emit events from the pricing message
+                        handle_text(text.as_str(), tx, &driver.name).await;
                     }
                     Some(Ok(Message::Close(frame))) => {
+                        // Server closed connection
                         let reason = frame.map(|f| f.reason.to_string()).unwrap_or_default();
-                        let _ = tx.send(MarketEvent::Status(ProviderStatus::Disconnected {
-                            provider: ProviderKind::Yahoo,
-                            reason: reason.clone(),
-                        })).await;
+                        let _ = tx.send(MarketEvent::Status {
+                            source: driver.name.clone(),
+                            status: ProviderStatus::Disconnected {
+                                provider: ProviderKind::Yahoo,
+                                reason: reason.clone(),
+                            }
+                        }).await;
                         return failed(&reason, &active);
                     }
-                    Some(Ok(_)) => {}
+                    Some(Ok(_)) => {} // Ignore binary/pong frames
                     Some(Err(e)) => {
-                        error!(provider = "yahoo", %e, "ws error");
-                        let _ = tx.send(MarketEvent::Status(ProviderStatus::Disconnected {
-                            provider: ProviderKind::Yahoo,
-                            reason: e.to_string(),
-                        })).await;
+                        // Network/IO error
+                        error!(provider = "yahoo", name = %driver.name, %e, "ws error");
+                        let _ = tx.send(MarketEvent::Status {
+                            source: driver.name.clone(),
+                            status: ProviderStatus::Disconnected {
+                                provider: ProviderKind::Yahoo,
+                                reason: e.to_string(),
+                            }
+                        }).await;
                         return failed(&e.to_string(), &active);
                     }
                     None => {
-                        let _ = tx.send(MarketEvent::Status(ProviderStatus::Disconnected {
-                            provider: ProviderKind::Yahoo,
-                            reason: "stream ended".into(),
-                        })).await;
+                        // Stream terminated
+                        let _ = tx.send(MarketEvent::Status {
+                            source: driver.name.clone(),
+                            status: ProviderStatus::Disconnected {
+                                provider: ProviderKind::Yahoo,
+                                reason: "stream ended".into(),
+                            }
+                        }).await;
                         return failed("stream ended", &active);
                     }
                 }
             }
             ctrl_msg = ctrl.recv() => {
+                // Handle dynamic subscription changes
                 match ctrl_msg {
                     Some(YahooControl::Subscribe(syms)) => {
+                        // Filter out already active symbols
                         let new: Vec<String> = syms.into_iter()
                             .filter(|s| !active.contains(s))
                             .collect();
                         if !new.is_empty() {
                             let payload = serde_json::json!({ "subscribe": new }).to_string();
-                            debug!(provider = "yahoo", out = %payload, "→ send");
+                            debug!(provider = "yahoo", name = %driver.name, out = %payload, "→ send");
                             if write.send(Message::Text(payload.into())).await.is_err() {
                                 return failed("control subscribe send failed", &active);
                             }
@@ -231,29 +287,34 @@ async fn ws_session(
                         }
                     }
                     Some(YahooControl::Unsubscribe(syms)) => {
-                        // Verified: {"unsubscribe":[...]} stops data without closing connection.
-                        // {"type":"unsubscribe",...} causes server close — do NOT use that form.
+                        // Send unsubscribe message. 
+                        // Note: uses {"unsubscribe":[]} format to avoid server disconnect.
                         let payload = serde_json::json!({ "unsubscribe": syms }).to_string();
-                        debug!(provider = "yahoo", out = %payload, "→ send");
+                        debug!(provider = "yahoo", name = %driver.name, out = %payload, "→ send");
                         if write.send(Message::Text(payload.into())).await.is_err() {
                             return failed("control unsubscribe send failed", &active);
                         }
                         active.retain(|s| !syms.contains(s));
                     }
                     None => {
-                        // Control channel closed; keep running without control.
+                        // Control channel closed; continue running with current symbols
                     }
                 }
             }
             _ = ping_timer.tick() => {
+                // Send periodic WebSocket ping to keep connection alive
                 let _ = write.send(Message::Ping(vec![].into())).await;
             }
             _ = silence_timer.tick() => {
-                warn!(provider = "yahoo", "silence timeout, reconnecting");
-                let _ = tx.send(MarketEvent::Status(ProviderStatus::Disconnected {
-                    provider: ProviderKind::Yahoo,
-                    reason: "silence timeout".into(),
-                })).await;
+                // Silence timeout triggered - no data received for silence_secs
+                warn!(provider = "yahoo", name = %driver.name, "silence timeout, reconnecting");
+                let _ = tx.send(MarketEvent::Status {
+                    source: driver.name.clone(),
+                    status: ProviderStatus::Disconnected {
+                        provider: ProviderKind::Yahoo,
+                        reason: "silence timeout".into(),
+                    }
+                }).await;
                 return failed("silence timeout", &active);
             }
         }
@@ -261,34 +322,44 @@ async fn ws_session(
 }
 
 fn failed(reason: &str, active: &[String]) -> SessionResult {
+    // Helper to construct a Failed session result with preserved symbols
     SessionResult::Failed {
         reason:          reason.to_string(),
         symbols_at_close: active.to_vec(),
     }
 }
 
-async fn handle_text(text: &str, tx: &mpsc::Sender<MarketEvent>) {
+// Decodes a Yahoo Finance JSON-wrapped base64 Protobuf message and emits events.
+async fn handle_text(text: &str, tx: &mpsc::Sender<MarketEvent>, source: &str) {
+    // Parse the JSON wrapper
     let obj: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => return,
     };
 
+    // Yahoo sends various message types; we only care about 'pricing'
     if obj["type"].as_str() != Some("pricing") {
-        debug!(provider = "yahoo", msg = text, "non-pricing message");
+        debug!(provider = "yahoo", name = source, msg = text, "non-pricing message");
         return;
     }
 
+    // Extract the base64-encoded Protobuf payload
     let b64 = match obj["message"].as_str() {
         Some(v) => v,
         None => return,
     };
 
+    // Decode Protobuf message
     match decode_yahoo_message(b64) {
         Ok(pricing) => {
-            let p: YahooPricing = pricing.into();
+            // Transform raw proto struct into normalized YahooPricing helper
+            let p: YahooPricing = pricing.clone().into();
             let ts = Utc.timestamp_millis_opt(p.time_ms).single().unwrap_or_else(Utc::now);
+            
+            // Log decoded pricing at trace level for debugging
             trace!(
                 provider = "yahoo",
+                name      = source,
                 symbol    = %p.symbol,
                 price     = p.price,
                 bid       = p.bid,
@@ -311,53 +382,63 @@ async fn handle_text(text: &str, tx: &mpsc::Sender<MarketEvent>) {
                 "pricing"
             );
 
+            // If a last trade price is present, emit a Trade event
             if p.price > 0.0 {
                 let _ = tx
-                    .send(MarketEvent::Trade(Trade {
-                        ticker:    p.symbol.clone(),
-                        timestamp: ts,
-                        price:     p.price,
-                        extras: TradeExtras::Yahoo(YahooTradeExtras {
-                            exchange:     p.exchange.clone(),
-                            currency:     p.currency.clone(),
-                            market_hours: p.market_hours,
-                            change:       p.change,
-                            change_pct:   p.change_pct,
-                            volume:       p.day_volume,
-                            open:         p.open_price,
-                            day_high:     p.day_high,
-                            day_low:      p.day_low,
-                            prev_close:   p.prev_close,
-                            market_cap:   p.market_cap,
-                            bid:          p.bid,
-                            ask:          p.ask,
-                            bid_size:     p.bid_size,
-                            ask_size:     p.ask_size,
-                            short_name:   p.short_name.clone(),
-                        }),
-                    }))
+                    .send(MarketEvent::Trade {
+                        source: source.to_string(),
+                        data: Trade {
+                            ticker:    p.symbol.clone(),
+                            timestamp: ts,
+                            price:     p.price,
+                            extras: TradeExtras::Yahoo(YahooTradeExtras {
+                                exchange:     p.exchange.clone(),
+                                currency:     p.currency.clone(),
+                                market_hours: p.market_hours,
+                                change:       p.change,
+                                change_pct:   p.change_pct,
+                                volume:       p.day_volume,
+                                open:         p.open_price,
+                                day_high:     p.day_high,
+                                day_low:      p.day_low,
+                                prev_close:   p.prev_close,
+                                market_cap:   p.market_cap,
+                                bid:          p.bid,
+                                ask:          p.ask,
+                                bid_size:     p.bid_size,
+                                ask_size:     p.ask_size,
+                                short_name:   p.short_name.clone(),
+                            }),
+                            raw: Some(format!("{:?}", pricing)),
+                        },
+                    })
                     .await;
             }
 
+            // If bid/ask prices are present, emit a Quote event
             if p.bid > 0.0 || p.ask > 0.0 {
                 let price = (p.bid + p.ask) / 2.0;
                 let _ = tx
-                    .send(MarketEvent::Quote(Quote {
-                        ticker:    p.symbol,
-                        timestamp: ts,
-                        price,
-                        extras: QuoteExtras::Yahoo(YahooQuoteExtras {
-                            bid:          p.bid,
-                            ask:          p.ask,
-                            bid_size:     p.bid_size,
-                            ask_size:     p.ask_size,
-                            exchange:     p.exchange,
-                            currency:     p.currency,
-                            market_hours: p.market_hours,
-                            change:       p.change,
-                            change_pct:   p.change_pct,
-                        }),
-                    }))
+                    .send(MarketEvent::Quote {
+                        source: source.to_string(),
+                        data: Quote {
+                            ticker:    p.symbol,
+                            timestamp: ts,
+                            price,
+                            extras: QuoteExtras::Yahoo(YahooQuoteExtras {
+                                bid:          p.bid,
+                                ask:          p.ask,
+                                bid_size:     p.bid_size,
+                                ask_size:     p.ask_size,
+                                exchange:     p.exchange,
+                                currency:     p.currency,
+                                market_hours: p.market_hours,
+                                change:       p.change,
+                                change_pct:   p.change_pct,
+                            }),
+                            raw: Some(format!("{:?}", pricing)),
+                        },
+                    })
                     .await;
             }
         }

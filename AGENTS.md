@@ -6,9 +6,28 @@ This file is for AI agents (and human developers) continuing work on this projec
 
 ## What this project is
 
-A Rust workspace that normalises multiple financial market data WebSocket APIs into a single event stream. It ships a library crate (`finstream-core`) and a binary (`finstream`) that runs either as a WebSocket gateway or an ndjson stdout printer.
+A Rust workspace that transforms multiple financial market data WebSocket APIs into a unified, high-performance multi-provider proxy. It ships a library crate (`finstream-core`) and a binary (`finstream`) that can run as a WebSocket gateway multiplexing data from several providers and accounts simultaneously.
 
-**One provider per session.** This is an intentional design constraint enforced in `builder.rs`. The session owner picks a provider via config/CLI. Multiple providers were removed because they add complexity, competing reconnect loops, and duplicate data with no benefit for the target use case (single data feed per process).
+**Multi-Provider Aggregator.** This project supports multiple concurrent connections to different providers (and multiple accounts of the same provider). Every event is tagged with its `source` at the root of the JSON output to ensure data from different feeds can be distinguished at the egress.
+
+---
+
+## Configuration
+
+Providers are defined as keyed tables in `finstream.toml`:
+
+```toml
+[providers.my_alpaca_account]
+type = "alpaca"
+enabled = true
+feed = "iex"
+
+[providers.crypto_feed]
+type = "finnhub"
+enabled = true
+```
+
+The key (e.g., `my_alpaca_account`) serves as the `source` identifier in the emitted data.
 
 ---
 

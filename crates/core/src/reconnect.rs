@@ -1,17 +1,25 @@
 use std::time::Duration;
 
+/// Defines the strategy for automatically reconnecting to a provider after a failure.
+///
+/// The policy uses exponential backoff with optional random jitter and supports
+/// limits based on either the number of attempts or total elapsed time.
 #[derive(Debug, Clone)]
 pub struct ReconnectPolicy {
     /// Stop retrying after this many attempts. `None` = no limit.
     pub max_retries:  Option<u32>,
     /// Stop retrying after this wall-clock duration. `None` = no limit.
     pub max_duration: Option<Duration>,
+    /// The base delay for the first reconnection attempt.
     pub initial_delay: Duration,
+    /// The absolute maximum delay allowed between retries.
     pub max_delay:     Duration,
+    /// Whether to apply random jitter (0.5x to 1.0x) to the computed delay.
     pub jitter:        bool,
 }
 
 impl Default for ReconnectPolicy {
+    /// Returns a standard policy: 1s initial, 60s max, jitter enabled, 1-hour total limit.
     fn default() -> Self {
         Self {
             max_retries:   None,
@@ -25,37 +33,49 @@ impl Default for ReconnectPolicy {
 
 impl ReconnectPolicy {
     /// Computes the sleep duration for the given attempt number (0-based).
+    ///
+    /// The delay grows exponentially (2^attempt) from the initial delay
+    /// and is capped by the maximum delay.
     pub fn next_delay(&self, attempt: u32) -> Duration {
+        // Calculate the exponential backoff: base * 2^attempt
         let base_secs = self.initial_delay.as_secs_f64()
             * 2_f64.powi(attempt as i32);
+        
+        // Ensure the delay does not exceed the configured maximum
         let capped = base_secs.min(self.max_delay.as_secs_f64());
 
+        // Apply random jitter if enabled to prevent thundering herds
         let final_secs = if self.jitter {
             use rand::Rng;
+            // Scale by a factor between 0.5 and 1.0
             let factor: f64 = rand::thread_rng().gen_range(0.5..=1.0);
             capped * factor
         } else {
             capped
         };
 
+        // Return duration, ensuring at least 100ms to avoid tight loops
         Duration::from_secs_f64(final_secs.max(0.1))
     }
 
     /// Returns `true` if the retry limit has been reached by either criterion.
     ///
-    /// `attempt` is the number of failed attempts so far (0-based before first retry).
-    /// `elapsed` is the wall-clock time since the first failure.
+    /// * `attempt`: The number of failed attempts so far (0-based before first retry).
+    /// * `elapsed`: The wall-clock time since the first failure.
     pub fn is_exceeded(&self, attempt: u32, elapsed: Duration) -> bool {
+        // Check if retry count limit is reached
         if let Some(max) = self.max_retries {
             if attempt >= max {
                 return true;
             }
         }
+        // Check if total wall-clock time limit is reached
         if let Some(max_dur) = self.max_duration {
             if elapsed >= max_dur {
                 return true;
             }
         }
+        // Neither limit reached
         false
     }
 }

@@ -15,23 +15,24 @@ use crate::{
     },
 };
 
-// Protocol (Polygon-compatible):
-//
-// 1. Connect  → server: [{"ev":"status","status":"connected","message":"Connected Successfully"}]
-// 2. Auth     → server: [{"ev":"status","status":"auth_success","message":"authenticated"}]
-//              On failure: [{"ev":"status","status":"auth_failed","message":"..."}]
-// 3. Subscribe→ server: [{"ev":"status","status":"success","message":"subscribed to: T.AAPL,..."}]
-// Events: [{"ev":"T","sym":"AAPL","p":...}]  [{"ev":"Q","sym":"AAPL","bp":...}]
-
+/// The WebSocket URL for the Massive (Polygon.io) stocks feed.
 const WS_URL: &str = "wss://socket.massive.com/stocks";
 
+/// Driver for the Massive (Polygon.io) real-time data WebSocket.
 pub struct MassiveDriver {
+    /// Unique name for this driver instance.
+    pub name:    String,
+    /// Massive (Polygon.io) API key.
     pub api_key: String,
 }
 
 impl ProviderDriver for MassiveDriver {
     fn kind(&self) -> ProviderKind {
         ProviderKind::Massive
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn validate(&self) -> Result<(), crate::error::FinStreamError> {
@@ -56,12 +57,11 @@ impl ProviderDriver for MassiveDriver {
 enum SessionResult {
     #[allow(dead_code)]
     Stopped,
-    /// Retryable failure (network error, server down).
     Failed(String),
-    /// Non-retryable failure (auth rejected, workflow error).
     Fatal(String),
 }
 
+// Internal run loop that handles automatic reconnection for Massive.
 async fn run_loop(
     driver: MassiveDriver,
     symbols: Vec<String>,
@@ -72,189 +72,231 @@ async fn run_loop(
     let mut first_failure: Option<Instant> = None;
 
     loop {
+        // Start a new WebSocket session
         match ws_session(&driver, &symbols, &tx).await {
-            SessionResult::Stopped => break,
+            SessionResult::Stopped => {
+                // Clean shutdown requested
+                break;
+            }
 
             SessionResult::Fatal(reason) => {
-                error!(provider = "massive", %reason, "fatal error — not retrying");
+                // Non-retryable error (e.g. invalid API key)
+                error!(provider = "massive", name = %driver.name, %reason, "fatal error — not retrying");
                 let _ = tx
-                    .send(MarketEvent::Status(ProviderStatus::Error {
-                        provider: ProviderKind::Massive,
-                        message:  reason,
-                    }))
+                    .send(MarketEvent::Status {
+                        source: driver.name.clone(),
+                        status: ProviderStatus::Error {
+                            provider: ProviderKind::Massive,
+                            message:  reason,
+                        }
+                    })
                     .await;
                 return;
             }
 
             SessionResult::Failed(reason) => {
+                // Retryable error (e.g. network timeout)
                 let elapsed = first_failure.get_or_insert_with(Instant::now).elapsed();
+                
+                // Check if we should stop retrying based on policy
                 if policy.is_exceeded(attempt, elapsed) {
                     let _ = tx
-                        .send(MarketEvent::Status(ProviderStatus::Error {
-                            provider: ProviderKind::Massive,
-                            message:  format!("retry limit reached: {reason}"),
-                        }))
+                        .send(MarketEvent::Status {
+                            source: driver.name.clone(),
+                            status: ProviderStatus::Error {
+                                provider: ProviderKind::Massive,
+                                message:  format!("retry limit reached: {reason}"),
+                            }
+                        })
                         .await;
                     return;
                 }
+                
+                // Calculate backoff delay
                 let delay = policy.next_delay(attempt);
                 attempt += 1;
-                warn!(provider = "massive", attempt, ?delay, %reason, "reconnecting");
+                warn!(provider = "massive", name = %driver.name, attempt, ?delay, %reason, "reconnecting");
+                
+                // Notify listeners about the reconnection attempt
                 let _ = tx
-                    .send(MarketEvent::Status(ProviderStatus::Reconnecting {
-                        provider: ProviderKind::Massive,
-                        attempt,
-                        delay_ms: delay.as_millis() as u64,
-                    }))
+                    .send(MarketEvent::Status {
+                        source: driver.name.clone(),
+                        status: ProviderStatus::Reconnecting {
+                            provider: ProviderKind::Massive,
+                            attempt,
+                            delay_ms: delay.as_millis() as u64,
+                        }
+                    })
                     .await;
+                
+                // Wait before next attempt
                 tokio::time::sleep(delay).await;
             }
         }
     }
 }
 
+// Internal session handler that performs Massive-specific auth and subscription.
 async fn ws_session(
     driver: &MassiveDriver,
     symbols: &[String],
     tx: &mpsc::Sender<MarketEvent>,
 ) -> SessionResult {
-    // ── Step 1: Connect ──────────────────────────────────────────────────────
+    // Establish WebSocket connection
     let (ws_stream, _) = match connect_async(WS_URL).await {
         Ok(v) => v,
         Err(e) => {
-            error!(provider = "massive", %e, "connect failed");
+            error!(provider = "massive", name = %driver.name, %e, "connect failed");
             return SessionResult::Failed(e.to_string());
         }
     };
 
     let (mut write, mut read) = ws_stream.split();
 
-    // ── Step 2: Expect [{"ev":"status","status":"connected",...}] ────────────
+    // ── Step 1: Expect connected status ──────────────────────────────────────
     match read.next().await {
         Some(Ok(Message::Text(text))) => {
+            // Massive sends an initial status message upon connection
             let msgs: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
             let first = &msgs[0];
             if first["ev"] != "status" || first["status"] != "connected" {
                 return SessionResult::Fatal(format!("unexpected connected message: {text}"));
             }
-            debug!(provider = "massive", "received connected");
+            debug!(provider = "massive", name = %driver.name, "received connected");
         }
         other => {
             return SessionResult::Fatal(format!("expected connected message, got: {other:?}"));
         }
     }
 
-    // ── Step 3: Authenticate ─────────────────────────────────────────────────
+    // ── Step 2: Send authentication ──────────────────────────────────────────
     let auth = serde_json::json!({ "action": "auth", "params": driver.api_key }).to_string();
-    debug!(provider = "massive", action = "auth", "→ send");
     if write.send(Message::Text(auth.into())).await.is_err() {
         return SessionResult::Failed("auth send failed".into());
     }
 
-    // ── Step 4: Expect [{"ev":"status","status":"auth_success",...}] ─────────
+    // ── Step 3: Expect auth response ─────────────────────────────────────────
     match read.next().await {
         Some(Ok(Message::Text(text))) => {
+            // Parse authentication response
             let msgs: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
             let first = &msgs[0];
             let status = first["status"].as_str().unwrap_or("");
+            // Handle explicit auth failures
             if status == "auth_failed" || status == "auth_timeout" {
                 let msg = first["message"].as_str().unwrap_or("auth failed").to_string();
-                error!(provider = "massive", %msg, "auth rejected");
                 return SessionResult::Fatal(msg);
             }
+            // Verify success
             if status != "auth_success" {
                 return SessionResult::Fatal(format!("unexpected auth response: {text}"));
             }
-            info!(provider = "massive", "authenticated");
+            info!(provider = "massive", name = %driver.name, "authenticated");
         }
         other => {
             return SessionResult::Fatal(format!("expected auth response, got: {other:?}"));
         }
     }
 
+    // Notify listeners that we are connected and authenticated
     let _ = tx
-        .send(MarketEvent::Status(ProviderStatus::Connected { provider: ProviderKind::Massive }))
+        .send(MarketEvent::Status {
+            source: driver.name.clone(),
+            status: ProviderStatus::Connected { provider: ProviderKind::Massive },
+        })
         .await;
 
-    // ── Step 5: Subscribe to trades and quotes ───────────────────────────────
+    // ── Step 4: Send subscription ────────────────────────────────────────────
     if !symbols.is_empty() {
+        // Construct a comma-separated list of T.SYMBOL and Q.SYMBOL
         let params: String = symbols
             .iter()
             .flat_map(|s| [format!("T.{s}"), format!("Q.{s}")])
             .collect::<Vec<_>>()
             .join(",");
         let sub = serde_json::json!({ "action": "subscribe", "params": params }).to_string();
-        debug!(provider = "massive", out = %sub, "→ send");
+        // Send subscription request
         if write.send(Message::Text(sub.into())).await.is_err() {
             return SessionResult::Failed("subscribe send failed".into());
         }
 
-        // ── Step 6: Expect [{"ev":"status","status":"success",...}] ──────────
+        // ── Step 5: Expect subscription confirmation ─────────────────────────
         match read.next().await {
             Some(Ok(Message::Text(text))) => {
                 let msgs: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                 let first = &msgs[0];
                 let status = first["status"].as_str().unwrap_or("");
                 if status != "success" {
-                    return SessionResult::Fatal(format!(
-                        "subscription failed: {text}"
-                    ));
+                    return SessionResult::Fatal(format!("subscription failed: {text}"));
                 }
-                let detail = first["message"].as_str().unwrap_or("");
-                info!(provider = "massive", %detail, ?symbols, "subscribed");
+                info!(provider = "massive", name = %driver.name, ?symbols, "subscribed");
             }
             other => {
-                return SessionResult::Fatal(format!(
-                    "expected subscription confirmation, got: {other:?}"
-                ));
+                return SessionResult::Fatal(format!("expected subscription confirmation, got: {other:?}"));
             }
         }
     }
 
-    // ── Message loop ─────────────────────────────────────────────────────────
     loop {
+        // ── Step 6: Message loop ─────────────────────────────────────────────
         match read.next().await {
             Some(Ok(Message::Text(text))) => {
-                handle_messages(text.as_str(), tx).await;
+                // Process batch of messages
+                handle_messages(text.as_str(), tx, &driver.name).await;
             }
             Some(Ok(Message::Ping(d))) => {
+                // Respond to WebSocket pings
                 let _ = write.send(Message::Pong(d)).await;
             }
             Some(Ok(Message::Close(frame))) => {
+                // Handle clean closure
                 let reason = frame.map(|f| f.reason.to_string()).unwrap_or_default();
                 let _ = tx
-                    .send(MarketEvent::Status(ProviderStatus::Disconnected {
-                        provider: ProviderKind::Massive,
-                        reason:   reason.clone(),
-                    }))
+                    .send(MarketEvent::Status {
+                        source: driver.name.clone(),
+                        status: ProviderStatus::Disconnected {
+                            provider: ProviderKind::Massive,
+                            reason:   reason.clone(),
+                        }
+                    })
                     .await;
                 return SessionResult::Failed(reason);
             }
-            Some(Ok(_)) => {}
             Some(Err(e)) => {
-                error!(provider = "massive", %e, "ws error");
+                // Handle network/IO errors
+                error!(provider = "massive", name = %driver.name, %e, "ws error");
                 let _ = tx
-                    .send(MarketEvent::Status(ProviderStatus::Disconnected {
-                        provider: ProviderKind::Massive,
-                        reason:   e.to_string(),
-                    }))
+                    .send(MarketEvent::Status {
+                        source: driver.name.clone(),
+                        status: ProviderStatus::Disconnected {
+                            provider: ProviderKind::Massive,
+                            reason:   e.to_string(),
+                        }
+                    })
                     .await;
                 return SessionResult::Failed(e.to_string());
             }
             None => {
+                // Stream ended unexpectedly
                 let _ = tx
-                    .send(MarketEvent::Status(ProviderStatus::Disconnected {
-                        provider: ProviderKind::Massive,
-                        reason:   "stream ended".into(),
-                    }))
+                    .send(MarketEvent::Status {
+                        source: driver.name.clone(),
+                        status: ProviderStatus::Disconnected {
+                            provider: ProviderKind::Massive,
+                            reason:   "stream ended".into(),
+                        }
+                    })
                     .await;
                 return SessionResult::Failed("stream ended".into());
             }
+            _ => {} // Ignore other frames
         }
     }
 }
 
-async fn handle_messages(text: &str, tx: &mpsc::Sender<MarketEvent>) {
+// Dispatches a Massive message batch to appropriate parsers.
+async fn handle_messages(text: &str, tx: &mpsc::Sender<MarketEvent>, source: &str) {
+    // Parse JSON array of messages
     let msgs: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => return,
@@ -264,38 +306,54 @@ async fn handle_messages(text: &str, tx: &mpsc::Sender<MarketEvent>) {
         None    => return,
     };
 
+    // Route each message in the batch
     for msg in arr {
         match msg["ev"].as_str() {
             Some("T") => {
-                if let Some(event) = parse_trade(msg) {
-                    let _ = tx.send(MarketEvent::Trade(event)).await;
+                // Parse normalized trade
+                if let Some(mut event) = parse_trade(msg) {
+                    event.raw = Some(msg.to_string());
+                    let _ = tx.send(MarketEvent::Trade {
+                        source: source.to_string(),
+                        data: event,
+                    }).await;
                 }
             }
             Some("Q") => {
-                if let Some(event) = parse_quote(msg) {
-                    let _ = tx.send(MarketEvent::Quote(event)).await;
+                // Parse normalized quote
+                if let Some(mut event) = parse_quote(msg) {
+                    event.raw = Some(msg.to_string());
+                    let _ = tx.send(MarketEvent::Quote {
+                        source: source.to_string(),
+                        data: event,
+                    }).await;
                 }
             }
             Some("status") => {
+                // Log non-auth status updates at debug level
                 debug!(
                     provider = "massive",
+                    name = source,
                     status = msg["status"].as_str().unwrap_or(""),
                     message = msg["message"].as_str().unwrap_or(""),
                     "status event"
                 );
             }
-            Some(ev) => debug!(provider = "massive", ev, "ignored"),
-            None => {}
+            _ => {}
         }
     }
 }
 
+// Parses a single Massive 'T' (trade) message into a normalized Trade struct.
 fn parse_trade(msg: &serde_json::Value) -> Option<Trade> {
+    // Extract required fields
     let ticker     = msg["sym"].as_str()?.to_string();
     let price      = msg["p"].as_f64()?;
     let size       = msg["s"].as_f64().unwrap_or(0.0);
     let time_ms    = msg["t"].as_i64().unwrap_or(0);
+    // Convert timestamp
     let timestamp  = Utc.timestamp_millis_opt(time_ms).single().unwrap_or_else(Utc::now);
+    // Convert integer condition codes to strings
     let conditions = msg["c"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_i64().map(|n| n.to_string())).collect())
@@ -306,18 +364,22 @@ fn parse_trade(msg: &serde_json::Value) -> Option<Trade> {
         timestamp,
         price,
         extras: TradeExtras::Massive(MassiveTradeExtras { size, conditions }),
+        raw:    None,
     })
 }
 
+// Parses a single Massive 'Q' (quote) message into a normalized Quote struct.
 fn parse_quote(msg: &serde_json::Value) -> Option<Quote> {
+    // Extract required fields
     let ticker = msg["sym"].as_str()?.to_string();
     let bid    = msg["bp"].as_f64().unwrap_or(0.0);
     let ask    = msg["ap"].as_f64().unwrap_or(0.0);
-    // bs/as are in round lots (100 shares each)
+    // Quote sizes are in round lots (100 shares), multiply to get actual count
     let bid_size = msg["bs"].as_f64().unwrap_or(0.0) * 100.0;
     let ask_size = msg["as"].as_f64().unwrap_or(0.0) * 100.0;
     let time_ms  = msg["t"].as_i64().unwrap_or(0);
     let timestamp = Utc.timestamp_millis_opt(time_ms).single().unwrap_or_else(Utc::now);
+    // Compute mid price
     let price = (bid + ask) / 2.0;
 
     Some(Quote {
@@ -325,5 +387,6 @@ fn parse_quote(msg: &serde_json::Value) -> Option<Quote> {
         timestamp,
         price,
         extras: QuoteExtras::Massive(MassiveQuoteExtras { bid, ask, bid_size, ask_size }),
+        raw:    None,
     })
 }

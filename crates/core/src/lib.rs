@@ -1,3 +1,11 @@
+//! # finstream-core
+//!
+//! A high-performance library for unified access to multiple financial market data providers.
+//!
+//! This crate provides normalized data structures ([`MarketEvent`], [`Trade`], [`Quote`])
+//! and a fluent [`FinStreamBuilder`] to connect to multiple WebSocket-based data feeds
+//! simultaneously.
+
 pub mod builder;
 pub mod client;
 pub mod config;

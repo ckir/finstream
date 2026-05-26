@@ -75,30 +75,51 @@ pub struct PricingData {
 /// Normalized data extracted from a Yahoo Finance pricing message.
 #[derive(Debug, Clone)]
 pub struct YahooPricing {
+    /// The ticker symbol.
     pub symbol:        String,
+    /// The last traded price.
     pub price:         f64,
+    /// The size of the last trade.
     pub last_size:     i64,
+    /// The current best bid price.
     pub bid:           f64,
+    /// The current best ask price.
     pub ask:           f64,
+    /// Size available at the bid.
     pub bid_size:      i64,
+    /// Size available at the ask.
     pub ask_size:      i64,
+    /// Event timestamp in milliseconds.
     pub time_ms:       i64,
+    /// The exchange code.
     pub exchange:      String,
+    /// The currency code.
     pub currency:      String,
+    /// Market hours state (0=pre, 1=regular, 2=post).
     pub market_hours:  i32,
+    /// Absolute change in price.
     pub change:        f64,
+    /// Percentage change in price.
     pub change_pct:    f64,
+    /// Total day volume.
     pub day_volume:    i64,
+    /// Day high price.
     pub day_high:      f64,
+    /// Day low price.
     pub day_low:       f64,
+    /// Opening price.
     pub open_price:    f64,
+    /// Previous closing price.
     pub prev_close:    f64,
+    /// Current market capitalization.
     pub market_cap:    f64,
+    /// Security short name.
     pub short_name:    String,
 }
 
 impl From<PricingData> for YahooPricing {
     fn from(p: PricingData) -> Self {
+        // Map raw f32/i64 proto fields to normalized f64/i64 fields
         Self {
             symbol:       p.id,
             price:        p.price as f64,
@@ -124,10 +145,15 @@ impl From<PricingData> for YahooPricing {
     }
 }
 
+/// Decodes a base64-encoded Protobuf message from Yahoo Finance.
 pub fn decode_yahoo_message(encoded: &str) -> Result<PricingData, String> {
     use base64::{engine::general_purpose, Engine as _};
+    
+    // Step 1: Decode the base64 string into raw bytes
     let decoded = general_purpose::STANDARD
         .decode(encoded)
         .map_err(|e| format!("base64: {e}"))?;
+    
+    // Step 2: Parse the raw bytes as a PricingData Protobuf message
     PricingData::decode(&decoded[..]).map_err(|e| format!("protobuf: {e}"))
 }

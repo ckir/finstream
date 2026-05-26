@@ -1,36 +1,38 @@
 # Project Roadmap: finstream
 
-This document outlines the planned features, architectural improvements, and missing functionality for future development cycles. It is intended to guide both human developers and AI agents.
+This document outlines the vision for transforming `finstream` into a high-performance, multi-provider financial data WebSocket proxy.
 
 ---
 
-## 🟢 Phase 1: Dynamic Subscription Management
-Currently, only the **Yahoo** provider supports mid-session subscribe/unsubscribe without a full connection reset. Alpaca and Finnhub require a reconnect to change symbols.
+## 🔵 Phase 0: Multi-Provider Core & Multi-Tenancy
+*Pivot from single-provider to aggregator.*
 
-- [ ] **Unified Control Channel**: Implement a standard `mpsc` control channel for all `ProviderDriver` implementations.
-- [ ] **Alpaca Unsubscribe**: Implement the `{"action": "unsubscribe", ...}` protocol.
-- [ ] **Finnhub Unsubscribe**: Implement the `{"type": "unsubscribe", "symbol": "..."}` protocol (note: requires individual messages per symbol).
-- [ ] **Massive Unsubscribe**: Implement the Polygon-compatible `{"action": "unsubscribe", "params": "..."}` protocol.
-- [ ] **Hot-Reloading Symbols**: Update `main.rs` and the gateway to allow updating symbols via the control channel without restarting the binary.
+- [ ] **Lift Provider Limit**: Refactor `FinStreamBuilder` to allow $N$ concurrent provider instances.
+- [ ] **Support Multi-Tenancy**: Update config and builder to support multiple accounts for the same provider (e.g., `alpaca_main` and `alpaca_test`).
+- [ ] **Egress Separation**: Add a `source` or `provider_id` field to `Trade` and `Quote` structs so consumers can distinguish between feeds at the egress.
+- [ ] **Configuration Overhaul**: Move to an array-based provider configuration in `finstream.toml`.
 
-## 🟡 Phase 2: Production Readiness & Stability
-- [ ] **Graceful Shutdown**: Replace `JoinHandle::abort()` with a `CancellationToken` (tokio-util) or a `watch` channel to allow drivers to send `Close` frames and clean up resources before exiting.
-- [ ] **Massive Live Verification**: Perform exhaustive live testing of the Massive.com provider once a valid API key with WebSocket access is available.
-- [ ] **Advanced Reconnect Logic**: Add support for exponential backoff with a custom "multiplier" parameter in `ReconnectPolicy`.
-- [ ] **Telemetry**: Add `metrics` crate support to track event counts, latency, and reconnection frequency per provider.
+## 🟢 Phase 1: Granular Feed Support
+Expand drivers to support all available data types (Trades, Quotes, Bars).
 
-## 🟠 Phase 3: Integration & FFI
-- [ ] **NAPI-RS Implementation**: Complete the `crates/napi` skeleton. Wire `FinStreamBuilder` to Node.js so the library can be used as a high-performance native module in JavaScript/TypeScript environments.
-- [ ] **Wasm Support**: Explore compiling `finstream-core` to WebAssembly for use in browser-based trading dashboards (requires replacing `tokio-tungstenite` with a Wasm-compatible WebSocket client like `gloo-net`).
+- [ ] **Alpaca Trades**: Implement the `t` (Trade) message handler.
+- [ ] **Aggregates (Bars)**: Add a new `MarketEvent::Bar` variant and implement support for Alpaca (`b`) and Massive (`AM`/`A`).
+- [ ] **Provider-Specific Symbols**: Allow each provider instance to have its own unique symbol list (overriding the global default).
 
-## 🔴 Phase 4: Data Expansion
-- [ ] **Alpaca SIP Feed**: Add explicit support and testing for the Alpaca SIP (consolidated) feed for users with "Unlimited" subscriptions.
-- [ ] **Massive Crypto/Forex**: Extend the Massive driver to support their non-equities endpoints.
-- [ ] **Historical Backfill**: Investigate adding a standard interface for fetching the last N minutes of trade/quote data upon connection (provider-dependent).
+## 🟡 Phase 2: Dynamic Control & Performance
+- [ ] **Unified Control Channel**: Implement a standard `mpsc` control channel for all drivers to support mid-session subscribe/unsubscribe.
+- [ ] **Backpressure Warnings**: Implement logic to detect and log warnings when the internal event buffer or WebSocket egress is nearing capacity.
+- [ ] **Zero-Copy Serialization**: Optimize the custom `Serialize` implementations to minimize allocations.
+
+## 🟠 Phase 3: Gateway Features
+- [ ] **Provider Filtering**: Support `?providers=acc1,acc2` filter in the WebSocket gateway.
+- [ ] **Rate Limiting**: Protect the gateway from slow consumers.
+- [ ] **NAPI-RS Implementation**: Complete Node.js bindings for high-performance integration.
 
 ---
 
-## Technical Debt & Gotchas to Address
-- **Yahoo Protobufs**: The `PricingData` struct in `proto_handler.rs` is manually maintained. If Yahoo updates their schema, this will need manual updates. Consider a more automated way to handle these fields if the schema becomes volatile.
-- **Provider Parity**: Not all providers emit both Trades and Quotes. Documentation should clearly state which `MarketEvent` variants to expect from which provider.
-- **Port Management**: The gateway server currently panics if the port is in use. Implement a more graceful error message and retry logic for the listener.
+## Architectural Decisions (Finalized)
+1.  **Deduplication**: **NONE**. All streams are forwarded independently.
+2.  **Normalization**: **NONE**. Ticker formats are provider-specific.
+3.  **Mixing**: Feeds are isolated via the `source` field in the egress JSON.
+4.  **Performance**: Rely on Rust/Hardware; use warning logs for backpressure.
