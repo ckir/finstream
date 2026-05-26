@@ -20,6 +20,13 @@ impl ProviderDriver for FinnhubDriver {
         ProviderKind::Finnhub
     }
 
+    fn validate(&self) -> Result<(), crate::error::FinStreamError> {
+        if self.api_token.is_empty() {
+            return Err(crate::error::FinStreamError::Config("Finnhub API token is missing".into()));
+        }
+        Ok(())
+    }
+
     fn spawn(
         self: Box<Self>,
         symbols: Vec<String>,

@@ -34,6 +34,13 @@ impl ProviderDriver for MassiveDriver {
         ProviderKind::Massive
     }
 
+    fn validate(&self) -> Result<(), crate::error::FinStreamError> {
+        if self.api_key.is_empty() {
+            return Err(crate::error::FinStreamError::Config("Massive API key is missing".into()));
+        }
+        Ok(())
+    }
+
     fn spawn(
         self: Box<Self>,
         symbols: Vec<String>,

@@ -22,6 +22,11 @@ pub mod yahoo;
 pub trait ProviderDriver: Send + 'static {
     fn kind(&self) -> ProviderKind;
 
+    /// Validate the driver configuration (e.g. check for missing API keys).
+    fn validate(&self) -> Result<(), crate::error::FinStreamError> {
+        Ok(())
+    }
+
     /// Consumes the driver and spawns a long-running tokio task.
     /// The task reconnects automatically according to `policy`.
     fn spawn(

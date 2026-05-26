@@ -87,10 +87,111 @@ impl FinStreamBuilder {
         let mut handles = Vec::with_capacity(self.providers.len());
 
         for (driver, policy) in self.providers {
+            driver.validate()?;
             let handle = driver.spawn(self.symbols.clone(), tx.clone(), policy);
             handles.push(handle);
         }
 
         Ok((FinStreamClient { handles }, rx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::yahoo::YahooDriver;
+    #[cfg(feature = "alpaca")]
+    use crate::providers::alpaca::{AlpacaDriver, AlpacaFeed};
+
+    #[test]
+    fn test_builder_single_provider_enforcement() {
+        let builder = FinStreamBuilder::new()
+            .provider(YahooDriver { silence_secs: 60, ping_interval_secs: 30 })
+            .provider(YahooDriver { silence_secs: 60, ping_interval_secs: 30 });
+
+        let result = builder.connect();
+        assert!(result.is_err());
+        if let Err(FinStreamError::Config(msg)) = result {
+            assert!(msg.contains("multiple"));
+        } else {
+            panic!("Expected config error");
+        }
+    }
+
+    #[test]
+    fn test_builder_no_provider_error() {
+        let builder = FinStreamBuilder::new();
+        let result = builder.connect();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "alpaca")]
+    fn test_alpaca_validation_missing_key() {
+        let builder = FinStreamBuilder::new()
+            .provider(AlpacaDriver {
+                api_key: "".into(),
+                api_secret: "secret".into(),
+                feed: AlpacaFeed::Iex,
+            });
+
+        let result = builder.connect();
+        assert!(result.is_err());
+        if let Err(FinStreamError::Config(msg)) = result {
+            assert!(msg.contains("Alpaca API key is missing"));
+        } else {
+            panic!("Expected config error for missing Alpaca key");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "alpaca")]
+    fn test_alpaca_validation_missing_secret() {
+        let builder = FinStreamBuilder::new()
+            .provider(AlpacaDriver {
+                api_key: "key".into(),
+                api_secret: "".into(),
+                feed: AlpacaFeed::Iex,
+            });
+
+        let result = builder.connect();
+        assert!(result.is_err());
+        if let Err(FinStreamError::Config(msg)) = result {
+            assert!(msg.contains("Alpaca API secret is missing"));
+        } else {
+            panic!("Expected config error for missing Alpaca secret");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "finnhub")]
+    fn test_finnhub_validation_missing_token() {
+        use crate::providers::finnhub::FinnhubDriver;
+        let builder = FinStreamBuilder::new()
+            .provider(FinnhubDriver { api_token: "".into() });
+
+        let result = builder.connect();
+        assert!(result.is_err());
+        if let Err(FinStreamError::Config(msg)) = result {
+            assert!(msg.contains("Finnhub API token is missing"));
+        } else {
+            panic!("Expected config error for missing Finnhub token");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "massive")]
+    fn test_massive_validation_missing_key() {
+        use crate::providers::massive::MassiveDriver;
+        let builder = FinStreamBuilder::new()
+            .provider(MassiveDriver { api_key: "".into() });
+
+        let result = builder.connect();
+        assert!(result.is_err());
+        if let Err(FinStreamError::Config(msg)) = result {
+            assert!(msg.contains("Massive API key is missing"));
+        } else {
+            panic!("Expected config error for missing Massive key");
+        }
     }
 }
